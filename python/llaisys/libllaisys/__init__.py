@@ -12,6 +12,8 @@ from .llaisys_types import llaisysStream_t
 from .tensor import llaisysTensor_t
 from .tensor import load_tensor
 from .ops import load_ops
+from .qwen2 import load_qwen2           # A3 新增：Qwen2 绑定注册函数
+from .qwen2 import LlaisysQwen2Meta, LlaisysQwen2Weights  # A3 新增：导出结构体类型
 
 
 def load_shared_library():
@@ -38,6 +40,7 @@ LIB_LLAISYS = load_shared_library()
 load_runtime(LIB_LLAISYS)
 load_tensor(LIB_LLAISYS)
 load_ops(LIB_LLAISYS)
+load_qwen2(LIB_LLAISYS)  # A3 新增：加载 Qwen2 模型 API
 
 
 __all__ = [

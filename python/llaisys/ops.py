@@ -19,9 +19,12 @@ class Ops:
         )
 
     @staticmethod
-    def linear(out: Tensor, inp: Tensor, weight: Tensor, bias: Tensor):
+    def linear(out: Tensor, inp: Tensor, weight: Tensor, bias: Tensor = None):
+        # A3 修改：bias 允许传 None（o_proj / mlp 等线性层无 bias）。
+        # ctypes 对 c_void_p 类型的参数传 None 就是 C 层的 NULL 指针，
+        # C++ 端 llaisysLinear 已加判空保护。
         LIB_LLAISYS.llaisysLinear(
-            out.lib_tensor(), inp.lib_tensor(), weight.lib_tensor(), bias.lib_tensor()
+            out.lib_tensor(), inp.lib_tensor(), weight.lib_tensor(), bias.lib_tensor() if bias else None
         )
 
     @staticmethod

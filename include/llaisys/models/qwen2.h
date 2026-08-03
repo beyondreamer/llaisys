@@ -37,6 +37,14 @@ __C {
 
     __export struct LlaisysQwen2Weights *llaisysQwen2ModelWeights(struct LlaisysQwen2Model * model);
 
+    // 前向推理：输入 token 数组，返回 argmax 选出的下一个 token id。
+    // 支持 prefill（ntoken>1）和解码（ntoken==1）两种模式。
     __export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model * model, int64_t * token_ids, size_t ntoken);
+
+    // KV cache 控制（A3 新增）：一轮生成开始前用 SetKvLen(0) 复位，
+    // 避免上一轮的历史 K/V 污染下一轮生成。
+    __export void llaisysQwen2ModelSetKvLen(struct LlaisysQwen2Model * model, int64_t len);
+
+    __export int64_t llaisysQwen2ModelGetKvLen(struct LlaisysQwen2Model * model);
 }
 #endif // LLAISYS_MODELS_QWEN2_H
