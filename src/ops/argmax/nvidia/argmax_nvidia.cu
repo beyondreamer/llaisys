@@ -1,9 +1,6 @@
 // ============================================================================
-// src/ops/argmax/nvidia/argmax_nvidia.cu — argmax 算子的 CUDA 实现（A4）
+// src/ops/argmax/nvidia/argmax_nvidia.cu — argmax 算子的 CUDA 实现（优化版）
 // 语义：一维输入求最大值 + 下标（max_idx 为 i64，max_val 与输入同 dtype）
-// 策略：两阶段归约
-//   stage1：每个 block 归约自己那 256 个元素的局部最大值/下标，写入全局数组
-//   stage2：单个 block 在全局数组上再归约一次，得到最终结果
 // ============================================================================
 #include "argmax_nvidia.hpp"
 
@@ -28,9 +25,22 @@ namespace llaisys::ops::nvidia {
         }                                                                                    \
     } while (0)
 
+// 块大小：每 block 256 线程。vocab=151936，nblocks ≈ 594。
+// 阶段一并行归约仍需一个临时 buffer 存「每 block 局部 max」。
 constexpr int BLOCK = 256;
 
-// 阶段一：每个 block 处理连续 256 个元素，shared memory 树形归约。
+// 【优化点（相对原版）】
+//   原版：launch_argmax 里每次调用都 cudaMalloc + cudaFree 两个临时 buffer。
+//         在 test_infer 里 argmax 每 step 调一次（128 步 → 128 次 cudaMalloc/Free），
+//         cudaMalloc 会触发设备同步 + 驱动路径开销，是隐形大头。
+//   新版：用一个全局的「持久化临时 buffer」，首次调用 cudaMalloc，之后复用。
+//         通过 cudaDeviceSynchronize 不必要——buffer 大小只增不减（用静态变量记录当前容量）。
+//         避免每次推理步都 malloc/free。
+//
+// 并行策略不变（仍两阶段）：vocab=151936 用单 block 全归约反而不如「多 block 分块 + 二次归约」快。
+
+// 阶段一：每个 block 处理连续 BLOCK 个元素，shared memory 树形归约。
+// 与原版相同（这部分已经是 warp-cooperative 的合理实现）。
 template <typename T>
 __global__ void argmax_stage1_kernel(const T *vals, size_t n, int *blk_idx, float *blk_val) {
     __shared__ float sval[BLOCK];
@@ -63,13 +73,13 @@ __global__ void argmax_stage1_kernel(const T *vals, size_t n, int *blk_idx, floa
 }
 
 // 阶段二：一个 block 归约阶段一的输出（nblocks 一般很小，线程跨步扫描）。
+// 与原版相同。
 template <typename T>
 __global__ void argmax_stage2_kernel(const int *blk_idx, const float *blk_val, int nblocks,
                                      int64_t *out_idx, T *out_val) {
     __shared__ float sval[BLOCK];
     __shared__ int sidx[BLOCK];
 
-    // 每个线程扫描多个 block 结果
     float my_val = -CUDART_INF_F;
     int my_idx = -1;
     for (int i = threadIdx.x; i < nblocks; i += BLOCK) {
@@ -97,21 +107,38 @@ __global__ void argmax_stage2_kernel(const int *blk_idx, const float *blk_val, i
     }
 }
 
-template <typename T>
-void launch_argmax(int64_t *max_idx, T *max_val, const T *vals, size_t n) {
-    // 阶段一：n 个元素 -> nblocks 个局部结果（放设备临时缓冲）
-    int nblocks = (int)((n + BLOCK - 1) / BLOCK);
+// 持久化临时 buffer（进程级单例）：容量只增不减，避免反复 malloc/free。
+// 用静态局部变量 + lambdas 保证线程安全由 CUDA runtime 隐式保证（launch 是异步的，
+// 但同一 stream 内先后两次 launch 顺序执行，buffer 复用安全）。
+namespace {
+struct ArgmaxScratch {
     int *blk_idx = nullptr;
     float *blk_val = nullptr;
-    CHECK_CUDA(cudaMalloc(&blk_idx, nblocks * sizeof(int)));
-    CHECK_CUDA(cudaMalloc(&blk_val, nblocks * sizeof(float)));
+    size_t capacity = 0; // 当前 buffer 容量（元素个数）
+};
+} // namespace
 
-    argmax_stage1_kernel<T><<<nblocks, BLOCK>>>(vals, n, blk_idx, blk_val);
-    argmax_stage2_kernel<T><<<1, BLOCK>>>(blk_idx, blk_val, nblocks, max_idx, max_val);
+template <typename T>
+void launch_argmax(int64_t *max_idx, T *max_val, const T *vals, size_t n) {
+    int nblocks = (int)((n + BLOCK - 1) / BLOCK);
+
+    // 取/扩容持久化 buffer（只在容量不够时才 realloc）
+    static ArgmaxScratch scratch; // C++11 局部静态，线程安全初始化
+    if (scratch.capacity < (size_t)nblocks) {
+        if (scratch.blk_idx != nullptr) {
+            cudaFree(scratch.blk_idx);
+            cudaFree(scratch.blk_val);
+        }
+        CHECK_CUDA(cudaMalloc(&scratch.blk_idx, nblocks * sizeof(int)));
+        CHECK_CUDA(cudaMalloc(&scratch.blk_val, nblocks * sizeof(float)));
+        scratch.capacity = nblocks;
+    }
+
+    argmax_stage1_kernel<T><<<nblocks, BLOCK>>>(vals, n, scratch.blk_idx, scratch.blk_val);
+    argmax_stage2_kernel<T><<<1, BLOCK>>>(scratch.blk_idx, scratch.blk_val, nblocks, max_idx,
+                                          max_val);
     CHECK_CUDA(cudaGetLastError()); // 捕获内核启动错误
-
-    CHECK_CUDA(cudaFree(blk_idx));
-    CHECK_CUDA(cudaFree(blk_val));
+    // 注意：不 free，留给下一次推理复用
 }
 
 

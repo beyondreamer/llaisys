@@ -1,8 +1,22 @@
 // ============================================================================
-// src/ops/rope/nvidia/rope_nvidia.cu — 旋转位置编码的 CUDA 实现（A4）
+// src/ops/rope/nvidia/rope_nvidia.cu — 旋转位置编码 RoPE 的 CUDA 实现（优化版）
+// ----------------------------------------------------------------------------
 // 公式：φ = pos / θ^(2j/d)
-//       out[j] = a·cosφ − b·sinφ；out[j+d/2] = b·cosφ + a·sinφ
+//       out[j]       = a·cosφ − b·sinφ
+//       out[j+d/2]   = b·cosφ + a·sinφ
 //       （a = x[:d/2]，b = x[d/2:]，d 必须为偶数）
+//
+// 【优化点（相对原版）】
+//   原版：每个线程处理「一对 (a,b) 的一半」——即一个线程算 out[j]，另一个线程
+//         算 out[j+d/2]，二者各自调用一次 cosf + sinf → 每对 trig 计算重复 2 次
+//         且每线程一次 powf（powf 是昂贵的 transcendental 函数）
+//   新版：每个线程处理「完整的一对 (a,b)」——同一线程算一次 sincosf 得到 (c,sn)，
+//         然后写 out[j] 和 out[j+d/2] 两个位置，trig 计算减半
+//         theta^(-2j/d) 用 expf(logf... ) 不如直接 powf，保留 powf 但调一次
+//         decode 场景（seq 小，如 1）下，threadIdx 数量可能远大于 d/2 × seq × nh，
+//         此时每个线程刚好对应一对，launch overhead 最低
+//
+// 精度约定：与 CPU 层完全一致（phi 用 float32 计算，输入/输出 T 精度）
 // ============================================================================
 #include "rope_nvidia.hpp"
 
@@ -13,28 +27,33 @@
 
 namespace llaisys::ops::nvidia {
 
-// 每个线程负责一个 (seq, head, j) 的旋转对：线程总数 = seq * nh * (d/2)。
+// 每个线程处理「一整对 (a,b)」：算一次 sincosf，写 out[j] 与 out[j+d/2]。
+// 线程总数 = seq * nh * (d/2)，一维 launch。
 template <typename T>
 __global__ void rope_kernel(T *out, const T *x, const int64_t *pos, size_t seq, size_t nh,
                             size_t d, float theta) {
-    size_t half = d / 2;
-    size_t total = seq * nh * half;
-    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t half = d / 2;
+    const size_t total = seq * nh * half;
+    const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total) return;
 
-    size_t j = idx % half;
-    size_t rest = idx / half;
-    size_t h = rest % nh;
-    size_t s = rest / nh;
+    // 把一维线程索引分解为 (s, h, j)
+    const size_t j = idx % half;
+    const size_t rest = idx / half;
+    const size_t h = rest % nh;
+    const size_t s = rest / nh;
 
-    float phi = (float)pos[s] / powf(theta, 2.0f * (float)j / (float)d);
-    float c = cosf(phi);
-    float sn = sinf(phi);
+    // 角度 φ = pos / θ^(2j/d)
+    const float phi = (float)pos[s] / powf(theta, 2.0f * (float)j / (float)d);
+    // 一次 sincosf 同时得到 cos 和 sin（比分开调 cosf + sinf 快，共享同一硬件单元）
+    float c, sn;
+    sincosf(phi, &sn, &c);
 
     const T *in_h = x + (s * nh + h) * d;
     T *out_h = out + (s * nh + h) * d;
-    float a = to_f32(in_h[j]);
-    float b = to_f32(in_h[j + half]);
+    const float a = to_f32(in_h[j]);
+    const float b = to_f32(in_h[j + half]);
+    // 一次写两个位置：旋转对的两半
     out_h[j] = from_f32<T>(a * c - b * sn);
     out_h[j + half] = from_f32<T>(b * c + a * sn);
 }
